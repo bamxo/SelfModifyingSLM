@@ -1,0 +1,57 @@
+# Conservative Pruner Configuration
+# This configuration prioritizes safety and model preservation over compression
+
+thresholds:
+  # Very low thresholds - only remove clearly dead/unused neurons
+  firing_frequency_threshold: 0.001   # Very low threshold
+  mean_activation_threshold: 0.0001   # Very low threshold
+  weight_magnitude_threshold: 0.01    # Low magnitude threshold
+  relative_magnitude_threshold: 0.01  # Conservative relative threshold
+  correlation_threshold: 0.95         # High correlation for redundancy
+  
+  # Conservative safety limits
+  min_neurons_per_layer: 2            # Keep at least 2 neurons per layer
+  max_sparsity_per_layer: 0.5         # Maximum 50% pruning per layer
+
+strategy:
+  default_strategy: "magnitude"       # Use magnitude-based (most reliable)
+  
+  # Conservative magnitude weighting
+  magnitude_weight: 0.7               # Emphasize magnitude over activity
+  activity_weight: 0.3
+  
+  # Conservative sparsity targets
+  target_sparsity: 0.1                # Only 10% overall pruning
+  
+  # Gradual approach if using gradual strategy
+  gradual_epochs: 20                  # Slower gradual pruning
+  gradual_schedule: "linear"          # Linear schedule (most predictable)
+
+logging:
+  log_level: "INFO"
+  log_to_file: true
+  log_file_path: "conservative_pruning.log"
+  log_to_console: true
+  verbose: true                       # Detailed logging for safety
+  show_progress: true
+  save_intermediate_results: true
+  generate_reports: true
+  save_visualizations: true
+  export_formats: ["json", "txt"]
+
+validation:
+  # Maximum validation and safety checks
+  validate_inputs: true
+  check_model_structure: true
+  validate_outputs: true
+  test_forward_pass: true
+  dry_run_first: true                 # Always dry run first
+  backup_model: true                  # Always backup
+  max_pruning_ratio: 0.3              # Maximum 30% overall pruning
+
+# Conservative global settings
+random_seed: 42
+device: "auto"
+num_workers: 1
+output_dir: "conservative_pruning_outputs"
+experiment_name: "conservative_pruning"

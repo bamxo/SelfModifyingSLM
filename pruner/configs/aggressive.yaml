@@ -1,0 +1,62 @@
+# Aggressive Pruner Configuration  
+# This configuration prioritizes maximum compression and model size reduction
+
+thresholds:
+  # Higher thresholds - more aggressive pruning
+  firing_frequency_threshold: 0.05    # Remove neurons with low activity
+  mean_activation_threshold: 0.01     # Higher activation threshold
+  weight_magnitude_threshold: 0.2     # Higher magnitude threshold
+  relative_magnitude_threshold: 0.1   # More aggressive relative threshold
+  correlation_threshold: 0.8          # Lower correlation for redundancy detection
+  
+  # Aggressive safety limits
+  min_neurons_per_layer: 1            # Allow down to 1 neuron per layer
+  max_sparsity_per_layer: 0.95        # Allow up to 95% pruning per layer
+
+strategy:
+  default_strategy: "magnitude"       # Magnitude-based for precision
+  
+  # Activity-focused weighting for aggressive pruning
+  magnitude_weight: 0.3               # Less emphasis on magnitude
+  activity_weight: 0.7                # More emphasis on activity
+  
+  # Aggressive sparsity targets
+  target_sparsity: 0.7                # 70% overall pruning target
+  
+  # Layer-specific aggressive pruning (example)
+  layer_specific_sparsity:
+    "network.0": 0.6                  # 60% pruning for first layer
+    "network.3": 0.8                  # 80% pruning for middle layer
+  
+  # Fast gradual pruning if using gradual strategy
+  gradual_epochs: 5                   # Faster convergence
+  gradual_schedule: "exponential"     # Exponential for rapid pruning
+
+logging:
+  log_level: "WARNING"                # Less verbose logging
+  log_to_file: true
+  log_file_path: "aggressive_pruning.log"
+  log_to_console: true
+  verbose: false                      # Less detailed output
+  show_progress: true
+  save_intermediate_results: false    # Don't save intermediate results
+  generate_reports: true
+  save_visualizations: false          # Skip visualizations for speed
+  export_formats: ["json"]            # Minimal export formats
+
+validation:
+  # Reduced validation for speed
+  validate_inputs: true
+  check_model_structure: false        # Skip structure check for speed
+  validate_outputs: true
+  test_forward_pass: true
+  dry_run_first: false                # Skip dry run for aggressive mode
+  backup_model: true                  # Still backup for safety
+  max_pruning_ratio: 0.9              # Allow up to 90% overall pruning
+
+# Aggressive global settings
+random_seed: 42
+device: "auto"
+num_workers: 1
+output_dir: "aggressive_pruning_outputs"
+experiment_name: "aggressive_pruning"

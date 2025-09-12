@@ -1,0 +1,52 @@
+{
+  "thresholds": {
+    "firing_frequency_threshold": 0.02,
+    "mean_activation_threshold": 0.005,
+    "weight_magnitude_threshold": 0.15,
+    "relative_magnitude_threshold": 0.08,
+    "correlation_threshold": 0.85,
+    "min_neurons_per_layer": 1,
+    "max_sparsity_per_layer": 0.8
+  },
+  "strategy": {
+    "default_strategy": "structured",
+    "magnitude_weight": 0.4,
+    "activity_weight": 0.6,
+    "structured_granularity": "channel",
+    "structured_group_size": 4,
+    "gradual_epochs": 8,
+    "gradual_schedule": "polynomial",
+    "gradual_power": 2.0,
+    "target_sparsity": 0.5,
+    "layer_specific_sparsity": {
+      "conv_layers": 0.6,
+      "fc_layers": 0.4
+    }
+  },
+  "logging": {
+    "log_level": "INFO",
+    "log_to_file": true,
+    "log_file_path": "structured_pruning.log",
+    "log_to_console": true,
+    "verbose": true,
+    "show_progress": true,
+    "save_intermediate_results": true,
+    "generate_reports": true,
+    "save_visualizations": true,
+    "export_formats": ["json", "yaml"]
+  },
+  "validation": {
+    "validate_inputs": true,
+    "check_model_structure": true,
+    "validate_outputs": true,
+    "test_forward_pass": true,
+    "dry_run_first": true,
+    "backup_model": true,
+    "max_pruning_ratio": 0.7
+  },
+  "random_seed": 42,
+  "device": "auto",
+  "num_workers": 2,
+  "output_dir": "structured_pruning_outputs",
+  "experiment_name": "structured_pruning_experiment"
+}

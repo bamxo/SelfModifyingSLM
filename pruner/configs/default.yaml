@@ -1,0 +1,85 @@
+# Default Pruner Configuration
+# This file contains reasonable default settings for neural network pruning
+
+# Pruning thresholds for determining which neurons to remove
+thresholds:
+  # Activity-based thresholds
+  firing_frequency_threshold: 0.01    # Minimum firing frequency to keep neuron (0.0-1.0)
+  mean_activation_threshold: 0.001    # Minimum mean activation magnitude
+  
+  # Magnitude-based thresholds
+  weight_magnitude_threshold: 0.1     # Minimum weight magnitude to keep neuron
+  relative_magnitude_threshold: 0.05  # Relative to max magnitude in layer
+  
+  # Correlation thresholds
+  correlation_threshold: 0.9          # Threshold for redundant neuron detection
+  
+  # Safety thresholds
+  min_neurons_per_layer: 1           # Minimum neurons to keep in any layer
+  max_sparsity_per_layer: 0.9        # Maximum fraction to prune from any layer (0.0-1.0)
+
+# Strategy configuration for different pruning approaches
+strategy:
+  # Strategy selection
+  default_strategy: "magnitude"      # Options: "magnitude", "structured", "gradual"
+  
+  # Magnitude strategy parameters
+  magnitude_weight: 0.5              # Weight for magnitude in combined scoring (0.0-1.0)
+  activity_weight: 0.5               # Weight for activity in combined scoring (0.0-1.0)
+  
+  # Structured strategy parameters
+  structured_granularity: "neuron"   # Options: "neuron", "channel", "filter"
+  structured_group_size: 1           # Size of groups to prune together
+  
+  # Gradual strategy parameters
+  gradual_epochs: 10                 # Number of epochs for gradual pruning
+  gradual_schedule: "polynomial"     # Options: "linear", "polynomial", "exponential"
+  gradual_power: 3.0                 # Power for polynomial schedule
+  
+  # Sparsity targets
+  target_sparsity: 0.3               # Overall target sparsity ratio (0.0-1.0)
+  layer_specific_sparsity: {}        # Layer-specific sparsity ratios (optional)
+
+# Logging and output configuration
+logging:
+  # Logging levels: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_level: "INFO"                  # Verbosity of log messages
+  log_to_file: true                  # Save logs to file
+  log_file_path: "pruning.log"      # Path for log file
+  log_to_console: true               # Show logs in console
+  
+  # Output verbosity
+  verbose: true                      # Detailed output during operations
+  show_progress: true                # Show progress bars/indicators
+  save_intermediate_results: true    # Save results at each step
+  
+  # Report generation
+  generate_reports: true             # Generate comprehensive reports
+  save_visualizations: true          # Save plots and heatmaps
+  export_formats:                    # Export formats for results
+    - "json"
+    - "txt"
+
+# Validation and safety checks
+validation:
+  # Pre-pruning validation
+  validate_inputs: true              # Validate recommendation inputs
+  check_model_structure: true        # Validate model structure before pruning
+  
+  # Post-pruning validation
+  validate_outputs: true             # Validate pruned model
+  test_forward_pass: true            # Test forward pass after pruning
+  
+  # Safety checks
+  dry_run_first: true                # Always do dry run before actual pruning
+  backup_model: true                 # Backup original model state
+  max_pruning_ratio: 0.8             # Maximum overall pruning ratio allowed (0.0-1.0)
+
+# Global settings
+random_seed: 42                      # For reproducible results (null for random)
+device: "auto"                       # Options: "cpu", "cuda", "auto"
+num_workers: 1                       # For parallel processing
+
+# Output paths
+output_dir: "pruning_outputs"        # Base directory for outputs
+experiment_name: "pruning_experiment" # Name for this pruning experiment
