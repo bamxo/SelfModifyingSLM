@@ -162,7 +162,7 @@ class IntegratedTrackingPruningWorkflow:
                 "cumulative_pruning": self.current_pruning_ratio
             }
         
-        self.logger.info(f"🔧 Iterative pruning step - Epoch {epoch}: targeting {target_ratio:.1%} reduction")
+        self.logger.info(f"Iterative pruning step - Epoch {epoch}: targeting {target_ratio:.1%} reduction")
         
         # Update config for this iteration
         original_target = self.config.strategy.target_sparsity
