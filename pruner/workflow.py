@@ -225,11 +225,31 @@ class IntegratedTrackingPruningWorkflow:
             self.current_step = "recommendations"
             recommendations = self.generate_recommendations()
             
+            # Validate recommendations
+            if recommendations is None:
+                self.logger.warning("Recommendations generation returned None, creating empty recommendations")
+                recommendations = {
+                    "statistics": {"total_prunable_neurons": 0},
+                    "prune": [],
+                    "merge": [],
+                    "expand": []
+                }
+            
             # Step 3: Apply pruning (if enabled)
             pruning_results = None
-            if auto_prune and recommendations.get("statistics", {}).get("total_prunable_neurons", 0) > 0:
+            total_prunable = recommendations.get("statistics", {}).get("total_prunable_neurons", 0)
+            self.logger.info(f"Found {total_prunable} prunable neurons")
+            
+            if auto_prune and total_prunable > 0:
                 self.current_step = "pruning"
                 pruning_results = self.run_pruning_phase(model, recommendations)
+            else:
+                self.logger.info(f"Skipping pruning: auto_prune={auto_prune}, prunable_neurons={total_prunable}")
+                pruning_results = {
+                    "status": "skipped",
+                    "reason": f"No prunable neurons found ({total_prunable})",
+                    "neurons_pruned": 0
+                }
             
             # Step 4: Generate comprehensive report
             self.current_step = "reporting"
@@ -293,17 +313,42 @@ class IntegratedTrackingPruningWorkflow:
         
         model.eval()  # Set to evaluation mode
         with torch.no_grad():
-            for batch_idx, (data, targets) in enumerate(data_loader):
+            for batch_idx, batch_data in enumerate(data_loader):
                 if num_batches and batch_idx >= num_batches:
                     break
                 
-                # Forward pass to collect activations
-                device = next(model.parameters()).device  # Get model's device
-                data = data.to(device, non_blocking=True)  # Move data to same device
-                _ = model(data)
+                # Handle different data formats (dictionaries for transformers, tuples for traditional models)
+                if isinstance(batch_data, dict):
+                    # Transformer format: {"input_ids": tensor, "attention_mask": tensor}
+                    input_ids = batch_data["input_ids"]
+                    attention_mask = batch_data.get("attention_mask", None)
+                    
+                    device = next(model.parameters()).device  # Get model's device
+                    input_ids = input_ids.to(device, non_blocking=True)
+                    
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(device, non_blocking=True)
+                        _ = model(input_ids=input_ids, attention_mask=attention_mask)
+                    else:
+                        _ = model(input_ids=input_ids)
+                    
+                    total_samples += input_ids.size(0)
+                    
+                elif isinstance(batch_data, (list, tuple)):
+                    # Traditional format: (data, targets)
+                    data, targets = batch_data
+                    device = next(model.parameters()).device  # Get model's device
+                    data = data.to(device, non_blocking=True)  # Move data to same device
+                    _ = model(data)
+                    total_samples += data.size(0)
+                else:
+                    # Single tensor format
+                    device = next(model.parameters()).device
+                    batch_data = batch_data.to(device, non_blocking=True)
+                    _ = model(batch_data)
+                    total_samples += batch_data.size(0)
                 
                 batch_count += 1
-                total_samples += data.size(0)
         
         # Stop tracking
         self.tracker.stop_tracking()
@@ -330,25 +375,57 @@ class IntegratedTrackingPruningWorkflow:
         """Generate pruning recommendations from tracking data."""
         self.logger.info("Phase 2: Generating pruning recommendations")
         
-        # Generate recommendations
-        recommendations = self.tracker.generate_optimization_recommendations(
-            pruning_threshold=self.config.thresholds.firing_frequency_threshold,
-            redundancy_threshold=self.config.thresholds.correlation_threshold,
-            saturation_threshold=0.95
-        )
-        
-        # Save recommendations to file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        recommendations_file = self.outputs_dir / "logs" / f"{self.workflow_id}_recommendations_{timestamp}.json"
-        
-        with open(recommendations_file, 'w') as f:
-            json.dump(recommendations, f, indent=2, default=str)
-        
-        prunable_neurons = recommendations.get("statistics", {}).get("total_prunable_neurons", 0)
-        self.logger.info(f"Recommendations generated: {prunable_neurons} neurons identified for pruning")
-        self.logger.info(f"Recommendations saved to: {recommendations_file}")
-        
-        return recommendations
+        try:
+            # Generate recommendations
+            recommendations = self.tracker.generate_optimization_recommendations(
+                pruning_threshold=self.config.thresholds.firing_frequency_threshold,
+                redundancy_threshold=self.config.thresholds.correlation_threshold,
+                saturation_threshold=0.95
+            )
+            
+            # Validate recommendations
+            if recommendations is None:
+                self.logger.warning("Tracker returned None recommendations, creating default structure")
+                recommendations = {
+                    "statistics": {"total_prunable_neurons": 0},
+                    "prune": [],
+                    "merge": [],
+                    "expand": []
+                }
+            
+            # Ensure required structure exists
+            if "statistics" not in recommendations:
+                recommendations["statistics"] = {"total_prunable_neurons": 0}
+            if "prune" not in recommendations:
+                recommendations["prune"] = []
+            if "merge" not in recommendations:
+                recommendations["merge"] = []
+            if "expand" not in recommendations:
+                recommendations["expand"] = []
+            
+            # Save recommendations to file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            recommendations_file = self.outputs_dir / "logs" / f"{self.workflow_id}_recommendations_{timestamp}.json"
+            
+            with open(recommendations_file, 'w') as f:
+                json.dump(recommendations, f, indent=2, default=str)
+            
+            prunable_neurons = recommendations.get("statistics", {}).get("total_prunable_neurons", 0)
+            self.logger.info(f"Recommendations generated: {prunable_neurons} neurons identified for pruning")
+            self.logger.info(f"Recommendations saved to: {recommendations_file}")
+            
+            return recommendations
+            
+        except Exception as e:
+            self.logger.error(f"Failed to generate recommendations: {e}")
+            # Return empty recommendations structure
+            return {
+                "statistics": {"total_prunable_neurons": 0},
+                "prune": [],
+                "merge": [],
+                "expand": [],
+                "error": str(e)
+            }
     
     def run_pruning_phase(self, model: nn.Module, recommendations: Dict[str, Any]) -> Dict[str, Any]:
         """Run the pruning phase."""
