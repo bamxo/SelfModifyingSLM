@@ -292,6 +292,7 @@ class NeuronPruner:
     def _build_dependency_graph(self, model: nn.Module) -> Dict[str, List[str]]:
         """
         Build a dependency graph of layers for efficient update ordering.
+        Enhanced to handle complex architectures like ResNet.
         
         Args:
             model: PyTorch model to analyze
@@ -303,16 +304,108 @@ class NeuronPruner:
             return self._cached_dependency_graph
         
         dependency_graph = defaultdict(list)
-        layer_names = [name for name, _ in model.named_modules() 
-                      if isinstance(_, (nn.Linear, nn.Conv2d, nn.Conv1d))]
         
-        # Build sequential dependencies (simplified heuristic)
-        for i, layer_name in enumerate(layer_names[:-1]):
-            next_layer_name = layer_names[i + 1]
-            dependency_graph[layer_name].append(next_layer_name)
+        # Check if this is a complex architecture (ResNet, DenseNet, etc.)
+        is_complex_arch = self._is_complex_architecture(model)
+        
+        if is_complex_arch:
+            # For complex architectures, be very conservative - only handle BatchNorm
+            self.logger.warning("Complex architecture detected (ResNet/DenseNet). Using conservative dependency mapping.")
+            dependency_graph = self._build_conservative_dependency_graph(model)
+        else:
+            # For simple architectures, use the full dependency analysis
+            dependency_graph = self._build_full_dependency_graph(model)
         
         self._cached_dependency_graph = dict(dependency_graph)
         return self._cached_dependency_graph
+    
+    def _is_complex_architecture(self, model: nn.Module) -> bool:
+        """Detect if this is a complex architecture with skip connections."""
+        model_str = str(model.__class__.__name__).lower()
+        
+        # Check for known complex architectures
+        complex_patterns = ['resnet', 'densenet', 'efficientnet', 'mobilenet', 'transformer']
+        
+        for pattern in complex_patterns:
+            if pattern in model_str:
+                return True
+        
+        # Check for nested Sequential modules (often indicates complex architecture)
+        nested_sequential_count = 0
+        for _, module in model.named_modules():
+            if isinstance(module, nn.Sequential):
+                nested_sequential_count += 1
+        
+        return nested_sequential_count > 3  # Threshold for complexity
+    
+    def _build_conservative_dependency_graph(self, model: nn.Module) -> Dict[str, List[str]]:
+        """Build conservative dependency graph for complex architectures."""
+        dependency_graph = defaultdict(list)
+        all_modules = list(model.named_modules())
+        
+        # Only map Conv -> BatchNorm dependencies, avoid sequential dependencies
+        for i, (layer_name, layer_module) in enumerate(all_modules):
+            if isinstance(layer_module, (nn.Conv2d, nn.Conv1d)):
+                # Look for immediate BatchNorm only
+                for j in range(i + 1, min(i + 2, len(all_modules))):  # Check next 1 layer only
+                    next_name, next_module = all_modules[j]
+                    if isinstance(next_module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                        dependency_graph[layer_name].append(next_name)
+                        break
+        
+        return dependency_graph
+    
+    def _build_full_dependency_graph(self, model: nn.Module) -> Dict[str, List[str]]:
+        """Build full dependency graph for simple architectures."""
+        dependency_graph = defaultdict(list)
+        all_modules = list(model.named_modules())
+        
+        # Full dependency analysis including sequential relationships
+        for i, (layer_name, layer_module) in enumerate(all_modules):
+            if isinstance(layer_module, (nn.Conv2d, nn.Conv1d, nn.Linear)):
+                # Look for dependent layers
+                for j in range(i + 1, min(i + 4, len(all_modules))):  # Check next 3 layers
+                    next_name, next_module = all_modules[j]
+                    if isinstance(next_module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                        dependency_graph[layer_name].append(next_name)
+                    elif isinstance(next_module, (nn.Conv2d, nn.Conv1d, nn.Linear)):
+                        # Sequential computation dependency
+                        dependency_graph[layer_name].append(next_name)
+                        break  # Only first sequential layer
+        
+        return dependency_graph
+    
+    def _validate_model_after_pruning(self, model: nn.Module) -> List[str]:
+        """Validate model structure after pruning to catch dimension mismatches."""
+        issues = []
+        
+        try:
+            # Try a small forward pass to detect dimension mismatches
+            model.eval()
+            with torch.no_grad():
+                # Create a small test input
+                if hasattr(model, 'conv1') or 'resnet' in str(model.__class__).lower():
+                    # For ResNet-like models, assume image input
+                    test_input = torch.randn(1, 3, 32, 32)  # Small test tensor
+                else:
+                    # For other models, try to infer input size
+                    first_layer = next(model.parameters())
+                    if len(first_layer.shape) > 2:  # Conv layer
+                        test_input = torch.randn(1, first_layer.shape[1], 32, 32)
+                    else:  # Linear layer
+                        test_input = torch.randn(1, first_layer.shape[1])
+                
+                # Move to same device as model
+                device = next(model.parameters()).device
+                test_input = test_input.to(device)
+                
+                # Try forward pass
+                _ = model(test_input)
+                
+        except Exception as e:
+            issues.append(f"Forward pass validation failed: {str(e)}")
+        
+        return issues
     
     def prune_neurons_by_ids(self, model: nn.Module, neuron_ids_to_prune: List[int], 
                            layer_mapping: Optional[Dict[int, Tuple[str, int]]] = None,
@@ -489,6 +582,13 @@ class NeuronPruner:
         if layers_needing_update:
             self._update_dependent_layers(model, layers_needing_update)
         
+        # Validate model structure after pruning for complex architectures
+        if self._is_complex_architecture(model):
+            validation_issues = self._validate_model_after_pruning(model)
+            if validation_issues:
+                self.logger.error(f"Model validation failed after pruning: {validation_issues}")
+                results["validation_issues"] = validation_issues
+        
         # Record timing
         if end_time:
             end_time.record()
@@ -558,7 +658,7 @@ class NeuronPruner:
     
     def _layer_needs_input_update(self, layer: nn.Module) -> bool:
         """Check if layer type requires input dimension updates after pruning."""
-        return isinstance(layer, (nn.Linear, nn.Conv2d, nn.Conv1d))
+        return isinstance(layer, (nn.Linear, nn.Conv2d, nn.Conv1d, nn.BatchNorm1d, nn.BatchNorm2d))
     
     def _update_layer_input_dim(self, model: nn.Module, layer_name: str, 
                                layer: nn.Module, input_reduction: int) -> None:
@@ -633,6 +733,23 @@ class NeuronPruner:
             if layer.bias is not None:
                 new_layer.bias.data = layer.bias.data.clone()
             
+            self._replace_layer_in_model(model, layer_name, new_layer)
+            
+        elif isinstance(layer, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            # For BatchNorm, input_reduction means the number of input channels was reduced
+            # We need to update the num_features to match the new input channel count
+            original_features = layer.num_features
+            new_num_features = original_features - input_reduction
+            
+            if new_num_features <= 0:
+                self.logger.warning(f"Cannot reduce BatchNorm features to {new_num_features} for {layer_name}")
+                return
+            
+            # Create indices for features to keep (remove the last 'input_reduction' features)
+            neurons_to_keep = list(range(new_num_features))
+            
+            # Use the existing BatchNorm pruning method
+            new_layer = self._prune_batchnorm_layer(layer, neurons_to_keep)
             self._replace_layer_in_model(model, layer_name, new_layer)
     
     def prune_from_json_recommendations(self, model: nn.Module, 

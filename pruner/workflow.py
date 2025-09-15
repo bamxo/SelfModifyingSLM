@@ -16,7 +16,7 @@ from datetime import datetime
 
 # Import components
 from .config import PrunerConfig, create_default_config
-from . import PruningEngine
+from .engine import PruningEngine
 from .model_io import PrunedModelRepresentation, ModelSerializer, create_pruning_report
 
 
@@ -50,6 +50,9 @@ class IntegratedTrackingPruningWorkflow:
         self.config = config or create_default_config()
         self.pruner = PruningEngine(tracker=self.tracker.tracker, config=self.config)
         
+        # Setup logger before output directories
+        self.logger = self.pruner.logger
+        
         # Setup output directories
         self.outputs_dir = Path(outputs_dir)
         self.setup_output_directories()
@@ -59,7 +62,6 @@ class IntegratedTrackingPruningWorkflow:
         self.current_step = "initialized"
         self.results = {}
         
-        self.logger = self.pruner.logger
         self.logger.info(f"Integrated workflow initialized with ID: {self.workflow_id}")
     
     def setup_output_directories(self):
@@ -163,9 +165,9 @@ class IntegratedTrackingPruningWorkflow:
         # Track model structure
         neuron_mapping = self.tracker.track_model(model, model_name)
         
-        # Register hooks and start tracking
+        # Register hooks and start tracking (disabled correlation analysis for speed)
         self.tracker.register_hooks()(model)
-        self.tracker.start_tracking(enable_correlation_analysis=True)
+        self.tracker.start_tracking(enable_correlation_analysis=False)
         
         # Collect activation data
         batch_count = 0
@@ -178,6 +180,8 @@ class IntegratedTrackingPruningWorkflow:
                     break
                 
                 # Forward pass to collect activations
+                device = next(model.parameters()).device  # Get model's device
+                data = data.to(device, non_blocking=True)  # Move data to same device
                 _ = model(data)
                 
                 batch_count += 1
@@ -237,11 +241,22 @@ class IntegratedTrackingPruningWorkflow:
             model, recommendations, dry_run=True
         )
         
-        self.logger.info(f"Dry run: {dry_run_results.get('neurons_pruned', 0)} neurons would be pruned")
+        # Log dry run results for both neuron and filter pruning
+        neurons_count = dry_run_results.get('neurons_pruned', 0)
+        filters_count = dry_run_results.get('filters_removed', 0)
+        if filters_count > 0:
+            self.logger.info(f"Dry run: {filters_count} filters would be pruned")
+        else:
+            self.logger.info(f"Dry run: {neurons_count} neurons would be pruned")
         
-        # Apply actual pruning if dry run was successful and we have neurons to prune
+        # Apply actual pruning if dry run was successful and we have items to prune
+        # Check for either neurons_pruned (traditional) or filters_removed (filter-based)
+        items_to_prune = max(
+            dry_run_results.get("neurons_pruned", 0),
+            dry_run_results.get("filters_removed", 0)
+        )
         if (dry_run_results.get("status") == "simulation" and 
-            dry_run_results.get("neurons_pruned", 0) > 0 and
+            items_to_prune > 0 and
             not self.config.validation.dry_run_first):
             
             self.logger.info("Applying actual pruning...")

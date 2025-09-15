@@ -7,6 +7,7 @@ including support for YAML/JSON files, validation, and easy customization.
 
 import json
 import logging
+from logging import Logger
 import os
 from dataclasses import dataclass, asdict, field
 from typing import Dict, Any, Optional, Union, List
@@ -94,6 +95,7 @@ class ValidationConfig:
     # Pre-pruning validation
     validate_inputs: bool = True         # Validate recommendation inputs
     check_model_structure: bool = True   # Validate model structure before pruning
+    validate_before_pruning: bool = True # Validate model before starting pruning process
     
     # Post-pruning validation
     validate_outputs: bool = True        # Validate pruned model
@@ -143,7 +145,7 @@ class PrunerConfig:
             errors.append("min_neurons_per_layer must be at least 1")
         
         # Validate strategy
-        valid_strategies = ["magnitude", "structured", "gradual"]
+        valid_strategies = ["magnitude", "structured", "gradual", "filter_structured"]
         if self.strategy.default_strategy not in valid_strategies:
             errors.append(f"default_strategy must be one of {valid_strategies}")
         
@@ -326,7 +328,7 @@ class PrunerConfig:
         
         return base_params
     
-    def setup_logging(self) -> logging.Logger:
+    def setup_logging(self) -> Logger:
         """Set up logging based on configuration."""
         logger = logging.getLogger("pruner")
         logger.setLevel(getattr(logging, self.logging.log_level))

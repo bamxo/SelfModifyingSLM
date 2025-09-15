@@ -15,6 +15,7 @@ from collections import defaultdict
 import math
 import logging
 from functools import lru_cache
+from .filter_pruning import FilterPruner
 
 
 class MagnitudePruner:
@@ -373,6 +374,152 @@ class MagnitudePruner:
         """Clear magnitude computation cache to free memory."""
         self._magnitude_cache.clear()
         self.compute_neuron_magnitudes.cache_clear()
+
+
+class FilterStructuredPruner:
+    """
+    Filter-based structured pruning strategy using neuron tracker recommendations.
+    
+    Removes entire filters/channels instead of individual weights to maintain
+    architectural validity and prevent dimension mismatches.
+    """
+    
+    def __init__(self, tracker: Optional[Any] = None):
+        self.tracker = tracker
+        self.logger = logging.getLogger(__name__)
+        self.filter_pruner = FilterPruner(self.logger)
+        
+    def set_tracker(self, tracker: Any) -> None:
+        """Set tracker instance."""
+        self.tracker = tracker
+    
+    def prune_by_recommendations(self, model: nn.Module, recommendations: Dict[str, Any], 
+                               dry_run: bool = True, **kwargs) -> Dict[str, Any]:
+        """
+        Apply filter-based structured pruning using neuron tracker recommendations.
+        
+        Args:
+            model: PyTorch model to prune
+            recommendations: Neuron tracker recommendations
+            dry_run: Whether to simulate pruning
+            **kwargs: Additional parameters
+            
+        Returns:
+            Filter pruning results
+        """
+        self.logger.info("Starting filter-based structured pruning")
+        
+        # Convert neuron recommendations to filter-level pruning plan
+        filter_plan = self.filter_pruner.convert_neuron_recommendations_to_filters(
+            recommendations, model
+        )
+        
+        if not filter_plan:
+            return {
+                "status": "no_action", 
+                "message": "No valid filters to prune from recommendations"
+            }
+        
+        # Log pruning plan
+        total_filters = sum(len(filters) for filters in filter_plan.values())
+        self.logger.info(f"Planning to prune {total_filters} filters from {len(filter_plan)} layers")
+        
+        for layer_name, filters in filter_plan.items():
+            self.logger.info(f"  {layer_name}: {len(filters)} filters")
+        
+        # Execute filter pruning
+        results = self.filter_pruner.prune_filters_structured(
+            model, filter_plan, dry_run=dry_run
+        )
+        
+        # Add strategy metadata
+        results["strategy"] = "filter_structured"
+        results["recommendation_metadata"] = {
+            "total_candidates": len(recommendations.get("prune", [])),
+            "converted_to_filters": total_filters,
+            "conversion_rate": total_filters / max(1, len(recommendations.get("prune", [])))
+        }
+        
+        return results
+    
+    def compute_filter_importance(self, model: nn.Module) -> Dict[str, torch.Tensor]:
+        """
+        Compute importance scores for filters/channels.
+        
+        Args:
+            model: PyTorch model to analyze
+            
+        Returns:
+            Dictionary mapping layer names to importance scores
+        """
+        importance_scores = {}
+        
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                if isinstance(module, (nn.Conv2d, nn.Conv1d)):
+                    # For conv layers, compute L2 norm of each filter
+                    weight = module.weight.data  # [out_channels, in_channels, ...]
+                    
+                    # Flatten each filter and compute L2 norm
+                    num_filters = weight.shape[0]
+                    filter_norms = []
+                    
+                    for i in range(num_filters):
+                        filter_weights = weight[i].flatten()
+                        filter_norm = torch.norm(filter_weights, p=2)
+                        filter_norms.append(filter_norm)
+                    
+                    importance_scores[name] = torch.tensor(filter_norms, device=weight.device)
+                
+                elif isinstance(module, nn.Linear):
+                    # For linear layers, compute L2 norm of each neuron's weights
+                    weight = module.weight.data  # [out_features, in_features]
+                    neuron_norms = torch.norm(weight, p=2, dim=1)
+                    importance_scores[name] = neuron_norms
+        
+        return importance_scores
+    
+    def prune_by_importance(self, model: nn.Module, sparsity_ratio: float = 0.2, 
+                          dry_run: bool = True) -> Dict[str, Any]:
+        """
+        Prune filters based on importance scores.
+        
+        Args:
+            model: PyTorch model to prune
+            sparsity_ratio: Fraction of filters to remove
+            dry_run: Whether to simulate pruning
+            
+        Returns:
+            Pruning results
+        """
+        # Compute importance scores
+        importance_scores = self.compute_filter_importance(model)
+        
+        # Create pruning plan based on importance
+        filter_plan = {}
+        
+        for layer_name, scores in importance_scores.items():
+            num_filters = len(scores)
+            num_to_remove = int(num_filters * sparsity_ratio)
+            
+            if num_to_remove > 0 and num_to_remove < num_filters:
+                # Remove least important filters
+                _, sorted_indices = torch.sort(scores)
+                filters_to_remove = sorted_indices[:num_to_remove].tolist()
+                filter_plan[layer_name] = filters_to_remove
+        
+        if not filter_plan:
+            return {"status": "no_action", "message": "No filters to prune"}
+        
+        # Execute pruning
+        results = self.filter_pruner.prune_filters_structured(
+            model, filter_plan, dry_run=dry_run
+        )
+        
+        results["strategy"] = "filter_structured_importance"
+        results["sparsity_ratio"] = sparsity_ratio
+        
+        return results
 
 
 class StructuredPruner:

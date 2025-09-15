@@ -208,6 +208,7 @@ class ActivationAnalyzer:
     def compute_layer_correlations(self, layer_name: str) -> Dict[Tuple[int, int], float]:
         """
         Compute Pearson correlations between all pairs of neurons in a layer.
+        Optimized for speed with sampling and early termination.
         
         Args:
             layer_name: Name of the layer to analyze
@@ -229,6 +230,13 @@ class ActivationAnalyzer:
         
         if len(available_neurons) < 2:
             return {}
+        
+        # Speed optimization: limit correlation analysis for large layers
+        max_neurons_for_correlation = 50  # Limit to prevent O(n²) explosion
+        if len(available_neurons) > max_neurons_for_correlation:
+            # Sample neurons randomly for speed
+            import random
+            available_neurons = random.sample(available_neurons, max_neurons_for_correlation)
         
         correlations = {}
         
