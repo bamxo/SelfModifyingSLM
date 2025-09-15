@@ -62,7 +62,15 @@ class IntegratedTrackingPruningWorkflow:
         self.current_step = "initialized"
         self.results = {}
         
+        # Iterative pruning state
+        self.warmup_epochs = 3  # Skip pruning for first 3 epochs
+        self.pruning_interval = 2  # Prune every 2 epochs after warmup
+        self.iterative_target = 0.05  # Prune 5% per iteration
+        self.total_pruning_budget = 0.3  # Maximum 30% total pruning
+        self.current_pruning_ratio = 0.0  # Track cumulative pruning
+        
         self.logger.info(f"Integrated workflow initialized with ID: {self.workflow_id}")
+        self.logger.info(f"Iterative pruning: warmup={self.warmup_epochs} epochs, interval={self.pruning_interval} epochs, target={self.iterative_target:.1%} per step")
     
     def setup_output_directories(self):
         """Setup required output directory structure."""
@@ -79,6 +87,116 @@ class IntegratedTrackingPruningWorkflow:
             directory.mkdir(parents=True, exist_ok=True)
         
         self.logger.info(f"Output directories setup in: {self.outputs_dir}")
+    
+    def should_prune_this_epoch(self, epoch: int) -> bool:
+        """
+        Determine if pruning should be performed for this epoch.
+        
+        Args:
+            epoch: Current epoch number (1-indexed)
+            
+        Returns:
+            True if pruning should be performed
+        """
+        # Skip pruning during warmup period
+        if epoch <= self.warmup_epochs:
+            return False
+        
+        # Check if we've hit our pruning budget
+        if self.current_pruning_ratio >= self.total_pruning_budget:
+            return False
+        
+        # Prune every pruning_interval epochs after warmup
+        epochs_since_warmup = epoch - self.warmup_epochs
+        return epochs_since_warmup % self.pruning_interval == 0
+    
+    def get_iterative_pruning_target(self, epoch: int) -> float:
+        """
+        Calculate the pruning target for this epoch based on iterative strategy.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            Pruning ratio target for this epoch
+        """
+        if not self.should_prune_this_epoch(epoch):
+            return 0.0
+        
+        # Calculate remaining budget
+        remaining_budget = self.total_pruning_budget - self.current_pruning_ratio
+        
+        # Use the smaller of iterative target or remaining budget
+        current_target = min(self.iterative_target, remaining_budget)
+        
+        return current_target
+    
+    def run_iterative_pruning_step(self, model: nn.Module, data_loader, epoch: int, 
+                                  model_name: str = "Model") -> Dict[str, Any]:
+        """
+        Run one step of iterative pruning for a specific epoch.
+        
+        Args:
+            model: PyTorch model to prune
+            data_loader: DataLoader for activation collection  
+            epoch: Current epoch number
+            model_name: Name for the model
+            
+        Returns:
+            Pruning step results
+        """
+        if not self.should_prune_this_epoch(epoch):
+            return {
+                "status": "skipped",
+                "reason": f"Epoch {epoch} - warmup or not pruning interval",
+                "epoch": epoch,
+                "cumulative_pruning": self.current_pruning_ratio
+            }
+        
+        target_ratio = self.get_iterative_pruning_target(epoch)
+        if target_ratio <= 0:
+            return {
+                "status": "budget_exhausted", 
+                "reason": f"Pruning budget exhausted ({self.current_pruning_ratio:.1%})",
+                "epoch": epoch,
+                "cumulative_pruning": self.current_pruning_ratio
+            }
+        
+        self.logger.info(f"🔧 Iterative pruning step - Epoch {epoch}: targeting {target_ratio:.1%} reduction")
+        
+        # Update config for this iteration
+        original_target = self.config.strategy.target_sparsity
+        self.config.strategy.target_sparsity = target_ratio
+        
+        try:
+            # Run the complete workflow for this step
+            results = self.run_complete_workflow(
+                model=model,
+                data_loader=data_loader,
+                model_name=f"{model_name}_Epoch_{epoch}",
+                num_batches=3,  # Quick analysis for iterative steps
+                auto_prune=True
+            )
+            
+            # Update cumulative pruning ratio if successful
+            if results.get("pruning_results", {}).get("status") == "completed":
+                neurons_pruned = results["pruning_results"].get("neurons_pruned", 0)
+                if neurons_pruned > 0:
+                    self.current_pruning_ratio += target_ratio
+                    self.logger.info(f"✅ Iterative step completed. Cumulative pruning: {self.current_pruning_ratio:.1%}")
+            
+            results["iterative_metadata"] = {
+                "epoch": epoch,
+                "target_ratio": target_ratio,
+                "cumulative_pruning": self.current_pruning_ratio,
+                "remaining_budget": self.total_pruning_budget - self.current_pruning_ratio
+            }
+            
+            return results
+            
+        finally:
+            # Restore original config
+            self.config.strategy.target_sparsity = original_target
     
     def run_complete_workflow(self, model: nn.Module, data_loader, model_name: str = "Model",
                             num_batches: Optional[int] = None, auto_prune: bool = True) -> Dict[str, Any]:

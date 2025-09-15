@@ -26,20 +26,20 @@ except ImportError:
 class PruningThresholds:
     """Configuration for pruning thresholds."""
     
-    # Activity-based thresholds
-    firing_frequency_threshold: float = 0.01  # Minimum firing frequency to keep neuron
-    mean_activation_threshold: float = 0.001  # Minimum mean activation magnitude
+    # Activity-based thresholds - Much more aggressive for real optimization
+    firing_frequency_threshold: float = 0.1   # Minimum firing frequency to keep neuron (10x higher)
+    mean_activation_threshold: float = 0.01   # Minimum mean activation magnitude (10x higher)
     
-    # Magnitude-based thresholds  
-    weight_magnitude_threshold: float = 0.1   # Minimum weight magnitude to keep neuron
-    relative_magnitude_threshold: float = 0.05  # Relative to max magnitude in layer
+    # Magnitude-based thresholds - More aggressive  
+    weight_magnitude_threshold: float = 0.3   # Minimum weight magnitude to keep neuron (3x higher)
+    relative_magnitude_threshold: float = 0.15 # Relative to max magnitude in layer (3x higher)
     
-    # Correlation thresholds
-    correlation_threshold: float = 0.9  # Threshold for redundant neuron detection
+    # Correlation thresholds - More sensitive to redundancy
+    correlation_threshold: float = 0.8  # Threshold for redundant neuron detection (lower = more aggressive)
     
-    # Safety thresholds
-    min_neurons_per_layer: int = 1      # Minimum neurons to keep in any layer
-    max_sparsity_per_layer: float = 0.9  # Maximum fraction to prune from any layer
+    # Safety thresholds - Balanced for real SLM optimization
+    min_neurons_per_layer: int = 8      # Minimum neurons to keep in any layer (reasonable minimum)
+    max_sparsity_per_layer: float = 0.4  # Maximum fraction to prune from any layer (40% max per layer)
 
 
 @dataclass
@@ -62,8 +62,8 @@ class StrategyConfig:
     gradual_schedule: str = "polynomial" # "linear", "polynomial", "exponential"
     gradual_power: float = 3.0           # Power for polynomial schedule
     
-    # Sparsity targets
-    target_sparsity: float = 0.3         # Overall target sparsity ratio
+    # Sparsity targets - Aggressive for real SLM optimization
+    target_sparsity: float = 0.25        # Overall target sparsity ratio (25% of parameters removed)
     layer_specific_sparsity: Dict[str, float] = field(default_factory=dict)
 
 
@@ -102,9 +102,9 @@ class ValidationConfig:
     test_forward_pass: bool = True       # Test forward pass after pruning
     
     # Safety checks
-    dry_run_first: bool = True          # Always do dry run before actual pruning
-    backup_model: bool = True           # Backup original model state
-    max_pruning_ratio: float = 0.8      # Maximum overall pruning ratio allowed
+    dry_run_first: bool = False         # Enable real pruning by default for production use
+    backup_model: bool = True           # Backup original model state (keep this for safety)
+    max_pruning_ratio: float = 0.5      # Maximum overall pruning ratio allowed (50% max total)
 
 
 @dataclass
@@ -501,20 +501,78 @@ def create_conservative_config() -> PrunerConfig:
 
 
 def create_aggressive_config() -> PrunerConfig:
-    """Create an aggressive configuration for maximum compression."""
+    """Create an aggressive configuration for real SLM optimization."""
     return PrunerConfig(
         thresholds=PruningThresholds(
-            firing_frequency_threshold=0.05,   # Higher threshold
-            max_sparsity_per_layer=0.95,      # Allow heavy pruning
-            min_neurons_per_layer=1
+            firing_frequency_threshold=0.15,   # Very aggressive activity threshold
+            weight_magnitude_threshold=0.4,    # High magnitude threshold
+            max_sparsity_per_layer=0.5,        # Allow up to 50% pruning per layer
+            min_neurons_per_layer=4             # Minimum 4 neurons per layer
         ),
         strategy=StrategyConfig(
-            target_sparsity=0.7,               # 70% pruning
-            magnitude_weight=0.3,              # Emphasize activity
-            activity_weight=0.7
+            target_sparsity=0.3,                # Target 30% overall sparsity
+            magnitude_weight=0.8,               # Heavily emphasize magnitude
+            activity_weight=0.2
         ),
         validation=ValidationConfig(
-            max_pruning_ratio=0.9              # Allow up to 90%
+            dry_run_first=False,               # Enable real pruning
+            max_pruning_ratio=0.5              # Allow up to 50% total pruning
+        )
+    )
+
+
+def create_production_config() -> PrunerConfig:
+    """
+    Create a production-ready pruning configuration for real SLM optimization.
+    Balanced between aggressive pruning and model stability.
+    """
+    return PrunerConfig(
+        thresholds=PruningThresholds(
+            firing_frequency_threshold=0.12,   # Aggressive but safe activity threshold
+            weight_magnitude_threshold=0.35,   # High magnitude threshold for real optimization
+            max_sparsity_per_layer=0.35,       # Conservative per-layer limit
+            min_neurons_per_layer=8,           # Safe minimum for most architectures
+            correlation_threshold=0.75          # Aggressive redundancy detection
+        ),
+        strategy=StrategyConfig(
+            target_sparsity=0.2,                # Target 20% overall sparsity (conservative but real)
+            magnitude_weight=0.7,               # Balanced scoring
+            activity_weight=0.3
+        ),
+        validation=ValidationConfig(
+            dry_run_first=False,               # Enable real pruning for production
+            max_pruning_ratio=0.4,             # Conservative total limit
+            test_forward_pass=True,            # Always validate
+            backup_model=True                  # Always backup
+        )
+    )
+
+
+def create_slm_transformer_config() -> PrunerConfig:
+    """
+    Create configuration optimized for SLM/Transformer pruning.
+    Focus on attention heads and embedding dimensions.
+    """
+    return PrunerConfig(
+        thresholds=PruningThresholds(
+            firing_frequency_threshold=0.08,   # More lenient for attention patterns
+            weight_magnitude_threshold=0.25,   # Lower for transformer weights
+            max_sparsity_per_layer=0.3,        # Conservative for attention layers
+            min_neurons_per_layer=16,          # Higher minimum for attention heads
+            correlation_threshold=0.7          # Aggressive redundancy for transformers
+        ),
+        strategy=StrategyConfig(
+            default_strategy="structured",     # Structured pruning for transformers
+            target_sparsity=0.15,              # Conservative 15% for stability
+            magnitude_weight=0.6,
+            activity_weight=0.4,
+            structured_granularity="channel"   # Channel-wise for attention heads
+        ),
+        validation=ValidationConfig(
+            dry_run_first=False,
+            max_pruning_ratio=0.3,             # Conservative for language models
+            test_forward_pass=True,
+            backup_model=True
         )
     )
 

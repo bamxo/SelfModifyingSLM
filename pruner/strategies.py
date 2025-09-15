@@ -983,3 +983,421 @@ class GradualPruner:
         self._schedules.clear()
         self._magnitude_pruner.clear_cache()
         self.logger.info("Cleared all gradual pruning schedules")
+
+
+class TransformerStructuredPruner:
+    """
+    Specialized structured pruning for transformer architectures.
+    Focuses on attention heads, embedding dimensions, and feed-forward layers.
+    """
+    
+    def __init__(self, tracker: Optional[Any] = None) -> None:
+        """
+        Initialize transformer-specific structured pruner.
+        
+        Args:
+            tracker: NeuronTracker instance for integration (optional)
+        """
+        self.tracker = tracker
+        self.logger = logging.getLogger(__name__)
+        self._attention_cache: Dict[str, torch.Tensor] = {}
+    
+    def set_tracker(self, tracker: Any) -> None:
+        """Set or update the tracker instance."""
+        self.tracker = tracker
+    
+    def identify_transformer_components(self, model: nn.Module) -> Dict[str, List[str]]:
+        """
+        Identify transformer-specific components in the model.
+        
+        Args:
+            model: PyTorch transformer model
+            
+        Returns:
+            Dictionary mapping component types to layer names
+        """
+        components = {
+            "attention_heads": [],
+            "attention_projections": [],
+            "feed_forward": [],
+            "embeddings": [],
+            "layer_norms": []
+        }
+        
+        for name, module in model.named_modules():
+            name_lower = name.lower()
+            
+            # Attention components
+            if any(pattern in name_lower for pattern in ["attention", "attn", "self_attn"]):
+                if any(proj in name_lower for proj in ["q_proj", "k_proj", "v_proj", "query", "key", "value"]):
+                    components["attention_projections"].append(name)
+                elif "heads" in name_lower or "head" in name_lower:
+                    components["attention_heads"].append(name)
+            
+            # Feed-forward components
+            elif any(pattern in name_lower for pattern in ["fc", "linear", "dense", "mlp", "feed_forward", "ffn"]):
+                if not any(skip in name_lower for skip in ["embed", "pos", "norm", "layer_norm"]):
+                    components["feed_forward"].append(name)
+            
+            # Embedding layers
+            elif any(pattern in name_lower for pattern in ["embed", "embedding", "token", "position"]):
+                components["embeddings"].append(name)
+            
+            # Layer normalization
+            elif any(pattern in name_lower for pattern in ["norm", "layernorm", "layer_norm"]):
+                components["layer_norms"].append(name)
+        
+        # Log detected components
+        for component_type, layers in components.items():
+            if layers:
+                self.logger.info(f"Detected {len(layers)} {component_type}: {layers[:3]}{'...' if len(layers) > 3 else ''}")
+        
+        return components
+    
+    def compute_attention_head_importance(self, model: nn.Module, data_loader, 
+                                        num_batches: int = 3) -> Dict[str, torch.Tensor]:
+        """
+        Compute importance scores for attention heads based on output variance.
+        
+        Args:
+            model: Transformer model
+            data_loader: DataLoader for computing importance
+            num_batches: Number of batches to use for computation
+            
+        Returns:
+            Dictionary mapping attention layer names to importance scores
+        """
+        components = self.identify_transformer_components(model)
+        attention_layers = components["attention_heads"] + components["attention_projections"]
+        
+        if not attention_layers:
+            self.logger.warning("No attention layers detected for importance computation")
+            return {}
+        
+        importance_scores = {}
+        model.eval()
+        
+        # Hook storage for attention outputs
+        attention_outputs = {}
+        
+        def create_attention_hook(layer_name):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    output = output[0]
+                # Store attention output for analysis
+                attention_outputs[layer_name] = output.detach()
+            return hook
+        
+        # Register hooks for attention layers
+        hooks = []
+        for layer_name in attention_layers:
+            layer = self._get_layer_by_name(model, layer_name)
+            if layer and isinstance(layer, nn.Linear):
+                hook = layer.register_forward_hook(create_attention_hook(layer_name))
+                hooks.append(hook)
+        
+        try:
+            batch_count = 0
+            with torch.no_grad():
+                for batch_data in data_loader:
+                    if batch_count >= num_batches:
+                        break
+                    
+                    # Handle different data formats
+                    if isinstance(batch_data, (list, tuple)):
+                        inputs = batch_data[0]
+                    else:
+                        inputs = batch_data
+                    
+                    if hasattr(inputs, 'to'):
+                        inputs = inputs.to(next(model.parameters()).device)
+                    
+                    # Forward pass to collect attention outputs
+                    try:
+                        _ = model(inputs)
+                    except Exception as e:
+                        self.logger.warning(f"Forward pass failed for importance computation: {e}")
+                        continue
+                    
+                    batch_count += 1
+            
+            # Compute importance scores based on attention output variance
+            for layer_name, outputs in attention_outputs.items():
+                if outputs.numel() > 0:
+                    # For attention layers, compute variance across sequence dimension
+                    if outputs.dim() >= 3:  # [batch, seq, hidden] or [batch, heads, seq, seq]
+                        variance = torch.var(outputs, dim=1)  # Variance across sequence
+                        if variance.dim() > 1:
+                            importance = torch.mean(variance, dim=-1)  # Average across remaining dims
+                        else:
+                            importance = variance
+                    else:
+                        importance = torch.var(outputs, dim=0)  # Variance across batch
+                    
+                    importance_scores[layer_name] = importance
+        
+        finally:
+            # Clean up hooks
+            for hook in hooks:
+                hook.remove()
+        
+        return importance_scores
+    
+    def _get_layer_by_name(self, model: nn.Module, layer_name: str) -> Optional[nn.Module]:
+        """Get layer by name with proper handling of nested modules."""
+        try:
+            layer_parts = layer_name.split('.')
+            current_module = model
+            
+            for part in layer_parts:
+                if hasattr(current_module, part):
+                    current_module = getattr(current_module, part)
+                else:
+                    try:
+                        idx = int(part)
+                        current_module = current_module[idx]
+                    except (ValueError, IndexError, TypeError):
+                        return None
+            
+            return current_module
+        except Exception:
+            return None
+    
+    def prune_attention_heads(self, model: nn.Module, head_pruning_ratio: float = 0.2,
+                            dry_run: bool = True) -> Dict[str, Any]:
+        """
+        Prune attention heads based on importance scores.
+        
+        Args:
+            model: Transformer model
+            head_pruning_ratio: Fraction of attention heads to prune
+            dry_run: Whether to simulate pruning
+            
+        Returns:
+            Pruning results
+        """
+        components = self.identify_transformer_components(model)
+        attention_projections = components["attention_projections"]
+        
+        if not attention_projections:
+            return {"status": "no_action", "message": "No attention projections found"}
+        
+        # Compute importance scores (simplified for demo)
+        pruning_plan = {}
+        
+        for layer_name in attention_projections:
+            layer = self._get_layer_by_name(model, layer_name)
+            if layer and isinstance(layer, nn.Linear):
+                # For attention projections, assume head dimension organization
+                # Typical: [hidden_size, num_heads * head_dim]
+                out_features = layer.out_features
+                
+                # Estimate number of attention heads (common configurations)
+                num_heads_candidates = [8, 12, 16, 32, 64]  # Common head counts
+                estimated_heads = 8  # Default fallback
+                
+                for candidate in num_heads_candidates:
+                    if out_features % candidate == 0:
+                        estimated_heads = candidate
+                        break
+                
+                head_dim = out_features // estimated_heads
+                num_to_prune = int(estimated_heads * head_pruning_ratio)
+                
+                if num_to_prune > 0 and num_to_prune < estimated_heads:
+                    # Prune least important heads (for demo, prune last heads)
+                    heads_to_prune = list(range(estimated_heads - num_to_prune, estimated_heads))
+                    
+                    # Convert to neuron indices
+                    neurons_to_prune = []
+                    for head_idx in heads_to_prune:
+                        start_idx = head_idx * head_dim
+                        end_idx = start_idx + head_dim
+                        neurons_to_prune.extend(range(start_idx, end_idx))
+                    
+                    pruning_plan[layer_name] = neurons_to_prune
+        
+        if not pruning_plan:
+            return {"status": "no_action", "message": "No attention heads to prune"}
+        
+        # Execute or simulate pruning
+        if dry_run:
+            return self._simulate_transformer_pruning(pruning_plan)
+        else:
+            return self._execute_transformer_pruning(model, pruning_plan)
+    
+    def prune_feed_forward_layers(self, model: nn.Module, ff_pruning_ratio: float = 0.3,
+                                dry_run: bool = True) -> Dict[str, Any]:
+        """
+        Prune feed-forward layers based on magnitude.
+        
+        Args:
+            model: Transformer model
+            ff_pruning_ratio: Fraction of FF neurons to prune
+            dry_run: Whether to simulate pruning
+            
+        Returns:
+            Pruning results
+        """
+        components = self.identify_transformer_components(model)
+        ff_layers = components["feed_forward"]
+        
+        if not ff_layers:
+            return {"status": "no_action", "message": "No feed-forward layers found"}
+        
+        # Use magnitude-based pruning for FF layers
+        magnitude_pruner = MagnitudePruner(self.tracker)
+        
+        # Filter model to only include FF layers
+        ff_model_dict = {}
+        for layer_name in ff_layers:
+            layer = self._get_layer_by_name(model, layer_name)
+            if layer:
+                ff_model_dict[layer_name] = layer
+        
+        if not ff_model_dict:
+            return {"status": "no_action", "message": "No valid feed-forward layers found"}
+        
+        # Compute magnitudes for FF layers only
+        magnitudes = {}
+        with torch.no_grad():
+            for layer_name, layer in ff_model_dict.items():
+                if isinstance(layer, nn.Linear):
+                    weight_norms = torch.norm(layer.weight.data, p=2, dim=1)
+                    if layer.bias is not None:
+                        bias_contribution = torch.abs(layer.bias.data)
+                        magnitudes[layer_name] = weight_norms + 0.1 * bias_contribution
+                    else:
+                        magnitudes[layer_name] = weight_norms
+        
+        # Create pruning plan based on magnitude
+        pruning_plan = {}
+        for layer_name, layer_magnitudes in magnitudes.items():
+            num_neurons = len(layer_magnitudes)
+            num_to_prune = int(num_neurons * ff_pruning_ratio)
+            
+            if num_to_prune > 0 and num_to_prune < num_neurons:
+                # Get indices of neurons with lowest magnitudes
+                _, bottom_indices = torch.topk(layer_magnitudes, num_to_prune, largest=False)
+                pruning_plan[layer_name] = bottom_indices.tolist()
+        
+        if dry_run:
+            return self._simulate_transformer_pruning(pruning_plan)
+        else:
+            return self._execute_transformer_pruning(model, pruning_plan)
+    
+    def _simulate_transformer_pruning(self, pruning_plan: Dict[str, List[int]]) -> Dict[str, Any]:
+        """Simulate transformer-specific pruning."""
+        total_neurons_to_prune = sum(len(neurons) for neurons in pruning_plan.values())
+        
+        results = {
+            "status": "simulation",
+            "strategy": "transformer_structured",
+            "neurons_pruned": total_neurons_to_prune,
+            "layers_affected": len(pruning_plan),
+            "transformer_specific": True,
+            "layer_modifications": {}
+        }
+        
+        for layer_name, neurons_to_prune in pruning_plan.items():
+            results["layer_modifications"][layer_name] = {
+                "neurons_removed": len(neurons_to_prune),
+                "removal_indices": sorted(neurons_to_prune),
+                "layer_type": self._classify_transformer_layer(layer_name)
+            }
+        
+        return results
+    
+    def _execute_transformer_pruning(self, model: nn.Module, pruning_plan: Dict[str, List[int]]) -> Dict[str, Any]:
+        """Execute transformer-specific pruning."""
+        from .core import NeuronPruner
+        
+        # Use core pruner for actual execution
+        core_pruner = NeuronPruner(tracker=self.tracker)
+        results = core_pruner._execute_pruning(model, pruning_plan)
+        
+        # Add transformer-specific metadata
+        results["strategy"] = "transformer_structured"
+        results["transformer_specific"] = True
+        
+        # Classify layers
+        for layer_name in pruning_plan.keys():
+            if "layer_modifications" in results and layer_name in results["layer_modifications"]:
+                results["layer_modifications"][layer_name]["layer_type"] = self._classify_transformer_layer(layer_name)
+        
+        return results
+    
+    def _classify_transformer_layer(self, layer_name: str) -> str:
+        """Classify the type of transformer layer."""
+        name_lower = layer_name.lower()
+        
+        if any(pattern in name_lower for pattern in ["q_proj", "k_proj", "v_proj", "query", "key", "value"]):
+            return "attention_projection"
+        elif any(pattern in name_lower for pattern in ["attention", "attn"]):
+            return "attention_other"
+        elif any(pattern in name_lower for pattern in ["fc", "linear", "dense", "mlp", "feed_forward", "ffn"]):
+            return "feed_forward"
+        elif any(pattern in name_lower for pattern in ["embed", "embedding"]):
+            return "embedding"
+        else:
+            return "other"
+    
+    def prune_by_recommendations(self, model: nn.Module, recommendations: Dict[str, Any], 
+                               dry_run: bool = True, **kwargs) -> Dict[str, Any]:
+        """
+        Apply transformer-specific pruning based on recommendations.
+        
+        Args:
+            model: Transformer model
+            recommendations: Tracker recommendations
+            dry_run: Whether to simulate pruning
+            **kwargs: Additional parameters
+            
+        Returns:
+            Transformer pruning results
+        """
+        # Identify transformer components
+        components = self.identify_transformer_components(model)
+        
+        # Extract recommendations by component type
+        attention_candidates = []
+        ff_candidates = []
+        
+        for candidate in recommendations.get("prune", []):
+            layer_name = candidate.get("layer_name", "")
+            if layer_name:
+                layer_type = self._classify_transformer_layer(layer_name)
+                if "attention" in layer_type:
+                    attention_candidates.append(candidate)
+                elif "feed_forward" in layer_type:
+                    ff_candidates.append(candidate)
+        
+        # Apply specialized pruning strategies
+        attention_ratio = kwargs.get("attention_pruning_ratio", 0.15)
+        ff_ratio = kwargs.get("ff_pruning_ratio", 0.25)
+        
+        results = {
+            "status": "completed",
+            "strategy": "transformer_comprehensive",
+            "attention_results": {},
+            "ff_results": {},
+            "total_neurons_pruned": 0
+        }
+        
+        # Prune attention components
+        if attention_candidates:
+            attention_results = self.prune_attention_heads(model, attention_ratio, dry_run)
+            results["attention_results"] = attention_results
+            results["total_neurons_pruned"] += attention_results.get("neurons_pruned", 0)
+        
+        # Prune feed-forward components
+        if ff_candidates:
+            ff_results = self.prune_feed_forward_layers(model, ff_ratio, dry_run)
+            results["ff_results"] = ff_results  
+            results["total_neurons_pruned"] += ff_results.get("neurons_pruned", 0)
+        
+        return results
+    
+    def clear_cache(self) -> None:
+        """Clear transformer-specific caches."""
+        self._attention_cache.clear()

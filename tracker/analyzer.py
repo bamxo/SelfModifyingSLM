@@ -12,102 +12,117 @@ from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
 
 
+class PickleableActivationHook:
+    """
+    Pickleable activation hook class that can be serialized.
+    Replaces lambda functions with proper class methods.
+    """
+    
+    def __init__(self, tracker, layer_name: str, layer_neuron_ids: List[int]):
+        self.tracker = tracker
+        self.layer_name = layer_name
+        self.layer_neuron_ids = layer_neuron_ids
+    
+    def __call__(self, module, input, output):
+        """Hook function that processes activations."""
+        if not self.tracker.tracking_enabled:
+            return
+        
+        # Convert output to tensor if needed and flatten batch dimension
+        if isinstance(output, tuple):
+            output = output[0]
+        
+        # Handle different output shapes
+        if output.dim() == 4:  # Conv2d output: (batch, channels, height, width)
+            # Average pool spatial dimensions to get per-channel activations
+            activations = output.mean(dim=(2, 3))  # Shape: (batch, channels)
+        elif output.dim() == 3:  # Conv1d or sequence output: (batch, channels, length)
+            activations = output.mean(dim=2)  # Shape: (batch, channels)
+        elif output.dim() == 2:  # Linear output: (batch, neurons)
+            activations = output
+        else:
+            # For other cases, try to reshape to (batch, neurons)
+            activations = output.view(output.size(0), -1)
+        
+        batch_size = activations.size(0)
+        num_neurons = activations.size(1)
+        
+        # Process each neuron's activations
+        for local_idx in range(min(num_neurons, len(self.layer_neuron_ids))):
+            neuron_id = self.layer_neuron_ids[local_idx]
+            neuron_activations = activations[:, local_idx]
+            
+            # Compute batch-level statistics
+            mean_activation = neuron_activations.mean().item()
+            variance_activation = neuron_activations.var().item()
+            
+            # Count non-zero activations (sparsity)
+            active_count = (torch.abs(neuron_activations) > self.tracker.activation_threshold).sum().item()
+            sparsity = active_count / batch_size
+            
+            # Store batch-level statistics
+            if neuron_id not in self.tracker.activation_stats:
+                self.tracker.activation_stats[neuron_id] = {
+                    'mean_sum': 0.0,
+                    'variance_sum': 0.0,
+                    'sparsity_sum': 0.0,
+                    'batch_count': 0
+                }
+            
+            stats = self.tracker.activation_stats[neuron_id]
+            stats['mean_sum'] += mean_activation
+            stats['variance_sum'] += variance_activation
+            stats['sparsity_sum'] += sparsity
+            stats['batch_count'] += 1
+            
+            # Store dataset-level statistics (accumulating)
+            if neuron_id not in self.tracker.dataset_stats:
+                self.tracker.dataset_stats[neuron_id] = {
+                    'activation_sum': 0.0,
+                    'activation_squared_sum': 0.0,
+                    'active_samples': 0,
+                    'total_samples': 0,
+                    'max_activation': float('-inf'),
+                    'min_activation': float('inf')
+                }
+
+            dataset_stats = self.tracker.dataset_stats[neuron_id]
+            dataset_stats['activation_sum'] += neuron_activations.sum().item()
+            dataset_stats['activation_squared_sum'] += (neuron_activations ** 2).sum().item()
+            dataset_stats['active_samples'] += active_count
+            dataset_stats['total_samples'] += batch_size
+            dataset_stats['max_activation'] = max(dataset_stats['max_activation'], neuron_activations.max().item())
+            dataset_stats['min_activation'] = min(dataset_stats['min_activation'], neuron_activations.min().item())
+            
+            # Collect activation vectors for correlation analysis if enabled
+            if self.tracker.collect_correlations and self.tracker.total_samples <= self.tracker.max_samples_for_correlation:
+                # Store individual activations for each sample in the batch
+                for sample_activation in neuron_activations:
+                    self.tracker.activation_vectors[neuron_id].append(sample_activation.item())
+
+
 class ActivationAnalyzer:
     """
     Analyzes neuron activations and computes various statistics.
+    Now with pickleable hooks for serialization support.
     """
     
     def __init__(self, tracker):
         self.tracker = tracker
+        self._hooks = []  # Store hook objects for cleanup
     
     def _create_activation_hook(self, layer_name: str, layer_neuron_ids: List[int]):
         """
-        Create a forward hook function for a specific layer.
+        Create a pickleable forward hook for a specific layer.
         
         Args:
             layer_name: Name of the layer
             layer_neuron_ids: List of neuron IDs for this layer
             
         Returns:
-            Hook function for the layer
+            Pickleable hook instance
         """
-        def hook_fn(module, input, output):
-            if not self.tracker.tracking_enabled:
-                return
-            
-            # Convert output to tensor if needed and flatten batch dimension
-            if isinstance(output, tuple):
-                output = output[0]
-            
-            # Handle different output shapes
-            if output.dim() == 4:  # Conv2d output: (batch, channels, height, width)
-                # Average pool spatial dimensions to get per-channel activations
-                activations = output.mean(dim=(2, 3))  # Shape: (batch, channels)
-            elif output.dim() == 3:  # Conv1d or sequence output: (batch, channels, length)
-                activations = output.mean(dim=2)  # Shape: (batch, channels)
-            elif output.dim() == 2:  # Linear output: (batch, neurons)
-                activations = output
-            else:
-                # For other cases, try to reshape to (batch, neurons)
-                activations = output.view(output.size(0), -1)
-            
-            batch_size = activations.size(0)
-            num_neurons = activations.size(1)
-            
-            # Process each neuron's activations
-            for local_idx in range(min(num_neurons, len(layer_neuron_ids))):
-                neuron_id = layer_neuron_ids[local_idx]
-                neuron_activations = activations[:, local_idx]
-                
-                # Compute batch-level statistics
-                mean_activation = neuron_activations.mean().item()
-                variance_activation = neuron_activations.var().item()
-                
-                # Count non-zero activations (sparsity)
-                active_count = (torch.abs(neuron_activations) > self.tracker.activation_threshold).sum().item()
-                sparsity = active_count / batch_size
-                
-                # Store batch-level statistics
-                if neuron_id not in self.tracker.activation_stats:
-                    self.tracker.activation_stats[neuron_id] = {
-                        'mean_sum': 0.0,
-                        'variance_sum': 0.0,
-                        'sparsity_sum': 0.0,
-                        'batch_count': 0
-                    }
-                
-                stats = self.tracker.activation_stats[neuron_id]
-                stats['mean_sum'] += mean_activation
-                stats['variance_sum'] += variance_activation
-                stats['sparsity_sum'] += sparsity
-                stats['batch_count'] += 1
-                
-                # Store dataset-level statistics (accumulating)
-                if neuron_id not in self.tracker.dataset_stats:
-                    self.tracker.dataset_stats[neuron_id] = {
-                        'activation_sum': 0.0,
-                        'activation_squared_sum': 0.0,
-                        'active_samples': 0,
-                        'total_samples': 0,
-                        'max_activation': float('-inf'),
-                        'min_activation': float('inf')
-                    }
-
-                dataset_stats = self.tracker.dataset_stats[neuron_id]
-                dataset_stats['activation_sum'] += neuron_activations.sum().item()
-                dataset_stats['activation_squared_sum'] += (neuron_activations ** 2).sum().item()
-                dataset_stats['active_samples'] += active_count
-                dataset_stats['total_samples'] += batch_size
-                dataset_stats['max_activation'] = max(dataset_stats['max_activation'], neuron_activations.max().item())
-                dataset_stats['min_activation'] = min(dataset_stats['min_activation'], neuron_activations.min().item())
-                
-                # Collect activation vectors for correlation analysis if enabled
-                if self.tracker.collect_correlations and self.tracker.total_samples <= self.tracker.max_samples_for_correlation:
-                    # Store individual activations for each sample in the batch
-                    for sample_activation in neuron_activations:
-                        self.tracker.activation_vectors[neuron_id].append(sample_activation.item())
-        
-        return hook_fn
+        return PickleableActivationHook(self.tracker, layer_name, layer_neuron_ids)
     
     def register_activation_hooks(self, model: nn.Module):
         """
@@ -116,15 +131,29 @@ class ActivationAnalyzer:
         Args:
             model: PyTorch model to add hooks to
         """
+        # Clear any existing hooks first
+        self.remove_hooks()
+        
         for layer_name, layer_info in self.tracker.layer_info.items():
             layer_module = layer_info['layer_module']
             layer_neuron_ids = layer_info['neuron_ids']
             
-            hook_fn = self._create_activation_hook(layer_name, layer_neuron_ids)
-            handle = layer_module.register_forward_hook(hook_fn)
+            hook_obj = self._create_activation_hook(layer_name, layer_neuron_ids)
+            handle = layer_module.register_forward_hook(hook_obj)
+            
+            # Store both the handle and hook object
             self.tracker.hooks.append(handle)
+            self._hooks.append(hook_obj)
         
-        print(f"Registered {len(self.tracker.hooks)} activation hooks")
+        print(f"Registered {len(self.tracker.hooks)} pickleable activation hooks")
+    
+    def remove_hooks(self):
+        """Remove all registered hooks and clear hook objects."""
+        for handle in self.tracker.hooks:
+            handle.remove()
+        self.tracker.hooks.clear()
+        self._hooks.clear()
+        print("Removed all activation hooks")
     
     def start_tracking(self, enable_correlation_analysis=False):
         """
