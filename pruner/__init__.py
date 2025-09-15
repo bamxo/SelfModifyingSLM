@@ -17,13 +17,14 @@ from typing import Dict, Any, Optional, Union
 import logging
 
 from .core import NeuronPruner
-from .strategies import MagnitudePruner, StructuredPruner, GradualPruner
+from .strategies import MagnitudePruner, StructuredPruner, GradualPruner, TransformerStructuredPruner
 from .utils import PruningMetrics, PruningValidator
 from .model_io import PrunedModelRepresentation, ModelSerializer, create_pruning_report
 from .config import (
     PrunerConfig, ConfigManager, PruningThresholds, StrategyConfig, 
     LoggingConfig, ValidationConfig, create_default_config, 
-    create_conservative_config, create_aggressive_config
+    create_conservative_config, create_aggressive_config,
+    create_production_config, create_slm_transformer_config
 )
 from .engine import PruningEngine
 from .workflow import (
@@ -38,9 +39,9 @@ from .test_functions import (
 )
 
 __version__ = "1.0.0"
-__all__ = ["NeuronPruner", "MagnitudePruner", "StructuredPruner", "GradualPruner", 
+__all__ = ["NeuronPruner", "MagnitudePruner", "StructuredPruner", "GradualPruner", "TransformerStructuredPruner",
            "PruningMetrics", "PruningValidator", "PruningEngine",
            "PrunedModelRepresentation", "ModelSerializer", "create_pruning_report",
-           "PrunerConfig", "ConfigManager", "create_default_config",
+           "PrunerConfig", "ConfigManager", "create_default_config", "create_production_config", "create_slm_transformer_config",
            "IntegratedTrackingPruningWorkflow", "create_simple_workflow",
            "load_and_validate_recommendations", "create_pruning_plan"]
