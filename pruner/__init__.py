@@ -18,6 +18,7 @@ import logging
 
 from .core import NeuronPruner
 from .strategies import MagnitudePruner, StructuredPruner, GradualPruner, TransformerStructuredPruner
+from .context_aware_strategies import ContextAwarePruner
 from .utils import PruningMetrics, PruningValidator
 from .model_io import PrunedModelRepresentation, ModelSerializer, create_pruning_report
 from .config import (
@@ -40,7 +41,7 @@ from .test_functions import (
 
 __version__ = "1.0.0"
 __all__ = ["NeuronPruner", "MagnitudePruner", "StructuredPruner", "GradualPruner", "TransformerStructuredPruner",
-           "PruningMetrics", "PruningValidator", "PruningEngine",
+           "ContextAwarePruner", "PruningMetrics", "PruningValidator", "PruningEngine",
            "PrunedModelRepresentation", "ModelSerializer", "create_pruning_report",
            "PrunerConfig", "ConfigManager", "create_default_config", "create_production_config", "create_slm_transformer_config",
            "IntegratedTrackingPruningWorkflow", "create_simple_workflow",

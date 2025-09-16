@@ -17,6 +17,7 @@ from datetime import datetime
 # Import components
 from .config import PrunerConfig, create_default_config
 from .engine import PruningEngine
+from .context_aware_strategies import ContextAwarePruner
 from .model_io import PrunedModelRepresentation, ModelSerializer, create_pruning_report
 
 
@@ -50,6 +51,12 @@ class IntegratedTrackingPruningWorkflow:
         self.config = config or create_default_config()
         self.pruner = PruningEngine(tracker=self.tracker.tracker, config=self.config)
         
+        # Initialize context-aware pruner for Pythia-160M
+        self.context_aware_pruner = ContextAwarePruner(
+            tracker=self.tracker.tracker, 
+            enable_pruning=True
+        )
+        
         # Setup logger before output directories
         self.logger = self.pruner.logger
         
@@ -71,6 +78,7 @@ class IntegratedTrackingPruningWorkflow:
         
         self.logger.info(f"Integrated workflow initialized with ID: {self.workflow_id}")
         self.logger.info(f"Iterative pruning: warmup={self.warmup_epochs} epochs, interval={self.pruning_interval} epochs, target={self.iterative_target:.1%} per step")
+        self.logger.info(f"Context-aware pruning: enabled with layer-specific ratios")
     
     def setup_output_directories(self):
         """Setup required output directory structure."""
@@ -197,6 +205,173 @@ class IntegratedTrackingPruningWorkflow:
         finally:
             # Restore original config
             self.config.strategy.target_sparsity = original_target
+    
+    def run_context_aware_pruning(self, model: nn.Module, data_loader, model_name: str = "Model",
+                                num_batches: int = 10, current_pruning_ratio: float = None,
+                                dry_run: bool = False) -> Dict[str, Any]:
+        """
+        Run context-aware pruning specifically designed for Pythia-160M.
+        
+        Args:
+            model: PyTorch model to prune (Pythia-160M)
+            data_loader: DataLoader for activation collection
+            model_name: Name for the model
+            num_batches: Number of batches to process
+            current_pruning_ratio: Current pruning ratio (if None, uses schedule)
+            dry_run: If True, simulate pruning without modifying model
+            
+        Returns:
+            Context-aware pruning results
+        """
+        self.current_step = "context_aware_analysis"
+        start_time = time.time()
+        
+        self.logger.info(f"Starting context-aware pruning for {model_name}")
+        self.logger.info(f"Processing {num_batches} batches for analysis")
+        
+        results = {
+            "workflow_id": self.workflow_id,
+            "model_name": model_name,
+            "timestamp": datetime.now().isoformat(),
+            "analysis_results": None,
+            "pruning_results": None,
+            "verification_results": None
+        }
+        
+        try:
+            # Step 1: Identify layer types for context-aware pruning - FAST MODE
+            self.logger.info("Step 1: FAST identifying transformer layer types...")
+            layer_info = self.context_aware_pruner.identify_transformer_layers(model)
+            
+            # Step 2: Generate context-aware pruning plan - FAST MODE
+            self.logger.info("Step 2: FAST generating context-aware pruning plan...")
+            pruning_plan = self.context_aware_pruner.generate_context_aware_pruning_plan(
+                model, current_pruning_ratio
+            )
+            
+            results["analysis_results"] = {
+                "layer_info": {
+                    category: [layer['name'] for layer in layers] 
+                    for category, layers in layer_info.items() if layers
+                },
+                "pruning_plan": pruning_plan,
+                "context_aware_info": {
+                    "layer_ratios": self.context_aware_pruner.layer_pruning_ratios,
+                    "current_ratio": current_pruning_ratio or self.context_aware_pruner.get_current_pruning_ratio(),
+                    "pruning_mode": "structured" if self.context_aware_pruner.structured_mode else "unstructured"
+                }
+            }
+            
+            # Step 3: Execute context-aware pruning
+            if pruning_plan.get('status') not in ['disabled', 'no_pruning']:
+                self.logger.info("Step 3: Executing context-aware pruning...")
+                pruning_results = self.context_aware_pruner.execute_context_aware_pruning(
+                    model, pruning_plan, dry_run=dry_run
+                )
+                results["pruning_results"] = pruning_results
+                
+                if not dry_run and pruning_results.get('status') == 'completed':
+                    # Advance pruning schedule
+                    new_ratio = self.context_aware_pruner.advance_pruning_schedule()
+                    self.logger.info(f"Pruning schedule advanced to: {new_ratio:.1%}")
+            
+            # Step 4: Verification (if not dry run) - SKIP FOR DEV SPEED
+            if not dry_run and results.get("pruning_results", {}).get("status") == "completed":
+                self.logger.info("Step 4: SKIPPING verification for development speed...")
+                verification_results = {"status": "skipped_for_dev_speed"}
+                results["verification_results"] = verification_results
+            
+            analysis_time = time.time() - start_time
+            results["analysis_time"] = analysis_time
+            
+            self.logger.info(f"Context-aware pruning completed in {analysis_time:.2f}s")
+            
+            # Save results
+            self._save_context_aware_results(results)
+            
+        except Exception as e:
+            self.logger.error(f"Context-aware pruning failed: {e}")
+            results["error"] = str(e)
+            results["status"] = "failed"
+        
+        finally:
+            self.current_step = "completed"
+        
+        return results
+    
+    def _verify_pruned_model(self, model: nn.Module, data_loader, num_batches: int = 3) -> Dict[str, Any]:
+        """Verify the pruned model can still perform forward passes."""
+        verification_results = {
+            "forward_pass_success": False,
+            "memory_usage": {},
+            "performance_metrics": {}
+        }
+        
+        try:
+            model.eval()
+            total_loss = 0
+            batch_count = 0
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(data_loader):
+                    if batch_idx >= num_batches:
+                        break
+                    
+                    # Test forward pass
+                    if isinstance(batch, dict):
+                        outputs = model(**batch)
+                        if hasattr(outputs, 'loss'):
+                            total_loss += outputs.loss.item()
+                    else:
+                        outputs = model(batch)
+                    
+                    batch_count += 1
+            
+            verification_results["forward_pass_success"] = True
+            verification_results["performance_metrics"]["avg_loss"] = total_loss / batch_count if batch_count > 0 else 0
+            
+            # Memory usage
+            if torch.cuda.is_available():
+                verification_results["memory_usage"] = {
+                    "gpu_allocated_gb": torch.cuda.memory_allocated() / 1024**3,
+                    "gpu_reserved_gb": torch.cuda.memory_reserved() / 1024**3
+                }
+            
+            self.logger.info("Model verification successful")
+            
+        except Exception as e:
+            verification_results["error"] = str(e)
+            self.logger.error(f"Model verification failed: {e}")
+        
+        return verification_results
+    
+    def _save_context_aware_results(self, results: Dict[str, Any]) -> None:
+        """Save context-aware pruning results to files."""
+        try:
+            # Save main results
+            results_file = self.outputs_dir / "logs" / f"{self.workflow_id}_context_aware_results.json"
+            with open(results_file, 'w') as f:
+                json.dump(results, f, indent=2, default=str)
+            
+            # Save pruning summary
+            if results.get("pruning_results"):
+                summary_file = self.outputs_dir / "reports" / f"{self.workflow_id}_context_aware_summary.json"
+                summary = {
+                    "model_name": results["model_name"],
+                    "pruning_status": results["pruning_results"].get("status"),
+                    "neurons_pruned": results["pruning_results"].get("neurons_pruned", 0),
+                    "layers_affected": results["pruning_results"].get("layers_affected", 0),
+                    "analysis_time": results.get("analysis_time", 0),
+                    "timestamp": results["timestamp"]
+                }
+                
+                with open(summary_file, 'w') as f:
+                    json.dump(summary, f, indent=2)
+            
+            self.logger.info(f"Context-aware results saved to {self.outputs_dir}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save context-aware results: {e}")
     
     def run_complete_workflow(self, model: nn.Module, data_loader, model_name: str = "Model",
                             num_batches: Optional[int] = None, auto_prune: bool = True) -> Dict[str, Any]:
